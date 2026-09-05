@@ -1,67 +1,242 @@
 const { chromium } = require("playwright");
 const cheerio = require("cheerio");
 const fs = require("fs");
+const path = require("path");
+
+// ============================================================
+// CONFIG
+// ============================================================
 
 const BASE_URL = "https://www.toolsvilla.com";
+
+// Start with the site's sitemap index.
+// The crawler will recursively discover child sitemaps.
 const SITEMAP_URL = `${BASE_URL}/sitemap/sitemap.xml`;
 
-const TARGET_PRODUCTS = 5000;
+// Set to Infinity for the complete authorized catalog.
+const TARGET_PRODUCTS = Infinity;
 
-// Keep this slow while testing.
-// We can optimize it after everything works.
-const DELAY_MS = 1000;
+// Number of pages processed simultaneously.
+// Start with 5. Increase only after testing.
+const CONCURRENCY = 5;
 
-const JSON_FILE = "products.json";
-const CSV_FILE = "products.csv";
+// Request timeout.
+const PAGE_TIMEOUT = 30_000;
 
+// Delay between retries/pages.
+const DELAY_MS = 800;
 
-// ======================================================
+// Number of retries for failed requests.
+const MAX_RETRIES = 3;
+
+// Save progress every N products.
+const SAVE_EVERY = 25;
+
+// Output directory.
+const OUTPUT_DIR = path.join(
+  process.cwd(),
+  "output"
+);
+
+const JSON_FILE = path.join(
+  OUTPUT_DIR,
+  "products.json"
+);
+
+const CSV_FILE = path.join(
+  OUTPUT_DIR,
+  "products.csv"
+);
+
+const FAILED_FILE = path.join(
+  OUTPUT_DIR,
+  "failed_urls.json"
+);
+
+const PROGRESS_FILE = path.join(
+  OUTPUT_DIR,
+  "progress.json"
+);
+
+// ============================================================
+// USER AGENT
+// ============================================================
+
+const USER_AGENT =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " +
+  "AppleWebKit/537.36 (KHTML, like Gecko) " +
+  "Chrome/151.0.0.0 Safari/537.36";
+
+// ============================================================
+// STATE
+// ============================================================
+
+let products = [];
+let failedUrls = [];
+let processedUrls = new Set();
+let productUrls = [];
+
+let shuttingDown = false;
+
+// ============================================================
+// FILE SYSTEM
+// ============================================================
+
+function ensureOutputDirectory() {
+  if (!fs.existsSync(OUTPUT_DIR)) {
+    fs.mkdirSync(OUTPUT_DIR, {
+      recursive: true
+    });
+  }
+}
+
+// ============================================================
 // HELPERS
-// ======================================================
+// ============================================================
 
 function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return new Promise(resolve =>
+    setTimeout(resolve, ms)
+  );
 }
 
 function cleanText(value) {
-  return String(value || "")
+  if (
+    value === null ||
+    value === undefined
+  ) {
+    return "";
+  }
+
+  return String(value)
     .replace(/\u00a0/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
 
-function absoluteUrl(url) {
+function normalizeUrl(url) {
   try {
-    return new URL(url, BASE_URL).href;
+    const parsed = new URL(
+      url,
+      BASE_URL
+    );
+
+    parsed.hash = "";
+
+    return parsed.href;
+  } catch {
+    return "";
+  }
+}
+
+function absoluteUrl(url) {
+  if (!url) {
+    return "";
+  }
+
+  try {
+    return new URL(
+      url,
+      BASE_URL
+    ).href;
   } catch {
     return "";
   }
 }
 
 function getNumber(value) {
-  if (value === null || value === undefined) {
+  if (
+    value === null ||
+    value === undefined ||
+    value === ""
+  ) {
     return null;
   }
 
   const cleaned = String(value)
     .replace(/,/g, "")
-    .replace(/[^\d.]/g, "");
+    .replace(/[^\d.-]/g, "");
 
   if (!cleaned) {
     return null;
   }
 
-  const number = parseFloat(cleaned);
+  const number = Number(
+    parseFloat(cleaned)
+  );
 
   return Number.isFinite(number)
     ? number
     : null;
 }
 
+function uniqueArray(array) {
+  return [
+    ...new Set(
+      array
+        .filter(Boolean)
+        .map(item =>
+          cleanText(item)
+        )
+        .filter(Boolean)
+    )
+  ];
+}
 
-// ======================================================
-// CSV
-// ======================================================
+// ============================================================
+// OUTPUT
+// ============================================================
+
+function saveJSON() {
+  fs.writeFileSync(
+    JSON_FILE,
+    JSON.stringify(
+      products,
+      null,
+      2
+    ),
+    "utf8"
+  );
+}
+
+function saveFailedUrls() {
+  fs.writeFileSync(
+    FAILED_FILE,
+    JSON.stringify(
+      failedUrls,
+      null,
+      2
+    ),
+    "utf8"
+  );
+}
+
+function saveProgress() {
+  fs.writeFileSync(
+    PROGRESS_FILE,
+    JSON.stringify(
+      {
+        updated_at:
+          new Date().toISOString(),
+
+        product_count:
+          products.length,
+
+        processed_url_count:
+          processedUrls.size,
+
+        failed_url_count:
+          failedUrls.length,
+
+        product_url_count:
+          productUrls.length
+      },
+      null,
+      2
+    ),
+    "utf8"
+  );
+}
 
 function csvEscape(value) {
   if (
@@ -77,16 +252,22 @@ function csvEscape(value) {
     output = output.join(" | ");
   }
 
-  if (typeof output === "object") {
-    output = JSON.stringify(output);
+  if (
+    typeof output === "object"
+  ) {
+    output =
+      JSON.stringify(output);
   }
 
   output = String(output);
 
-  return `"${output.replace(/"/g, '""')}"`;
+  return `"${output.replace(
+    /"/g,
+    '""'
+  )}"`;
 }
 
-function saveCSV(products) {
+function saveCSV() {
   const headers = [
     "url",
     "product_id",
@@ -110,19 +291,21 @@ function saveCSV(products) {
     "scraped_at"
   ];
 
-  const lines = [];
-
-  lines.push(
+  const lines = [
     headers
       .map(csvEscape)
       .join(",")
-  );
+  ];
 
-  for (const product of products) {
+  for (
+    const product of products
+  ) {
     lines.push(
       headers
-        .map((header) =>
-          csvEscape(product[header])
+        .map(header =>
+          csvEscape(
+            product[header]
+          )
         )
         .join(",")
     );
@@ -135,73 +318,106 @@ function saveCSV(products) {
   );
 }
 
-
-// ======================================================
-// JSON-LD
-// ======================================================
-
-function extractJsonLd($) {
-  const results = [];
-
-  $('script[type="application/ld+json"]').each(
-    (_, element) => {
-      try {
-        const text = $(element)
-          .text()
-          .trim();
-
-        if (!text) {
-          return;
-        }
-
-        const data = JSON.parse(text);
-
-        if (Array.isArray(data)) {
-          results.push(...data);
-        } else if (data["@graph"]) {
-          results.push(...data["@graph"]);
-        } else {
-          results.push(data);
-        }
-      } catch {
-        // Ignore invalid JSON-LD
-      }
-    }
+function saveAll() {
+  console.log(
+    "\n💾 Saving checkpoint..."
   );
 
-  return results;
+  saveJSON();
+  saveCSV();
+  saveFailedUrls();
+  saveProgress();
+
+  console.log(
+    `   Products: ${products.length}`
+  );
 }
 
-function findProductJsonLd(data) {
-  for (const item of data) {
-    if (!item) {
-      continue;
-    }
+// ============================================================
+// RESUME
+// ============================================================
 
-    const type = item["@type"];
-
-    if (
-      type === "Product" ||
-      (
-        Array.isArray(type) &&
-        type.includes("Product")
-      )
-    ) {
-      return item;
-    }
+function loadPreviousProgress() {
+  if (
+    !fs.existsSync(JSON_FILE)
+  ) {
+    return;
   }
 
-  return null;
+  try {
+    const data =
+      JSON.parse(
+        fs.readFileSync(
+          JSON_FILE,
+          "utf8"
+        )
+      );
+
+    if (
+      Array.isArray(data)
+    ) {
+      products = data;
+
+      for (
+        const product of products
+      ) {
+        if (
+          product.url
+        ) {
+          processedUrls.add(
+            normalizeUrl(
+              product.url
+            )
+          );
+        }
+      }
+
+      console.log(
+        `♻️ Resumed ${products.length} previously saved products.`
+      );
+    }
+  } catch (error) {
+    console.log(
+      "⚠️ Could not load previous products.json:",
+      error.message
+    );
+  }
+
+  if (
+    fs.existsSync(
+      FAILED_FILE
+    )
+  ) {
+    try {
+      failedUrls =
+        JSON.parse(
+          fs.readFileSync(
+            FAILED_FILE,
+            "utf8"
+          )
+        );
+
+      if (
+        !Array.isArray(
+          failedUrls
+        )
+      ) {
+        failedUrls = [];
+      }
+    } catch {
+      failedUrls = [];
+    }
+  }
 }
 
-
-// ======================================================
+// ============================================================
 // URL FILTER
-// ======================================================
+// ============================================================
 
 function isCandidateProductUrl(url) {
   try {
-    const parsed = new URL(url);
+    const parsed =
+      new URL(url);
 
     if (
       parsed.hostname !==
@@ -212,30 +428,17 @@ function isCandidateProductUrl(url) {
 
     const pathname =
       parsed.pathname
-        .toLowerCase();
+        .toLowerCase()
+        .replace(/\/+$/, "");
 
-    // Homepage
     if (
-      pathname === "/" ||
+      !pathname ||
       pathname === ""
     ) {
       return false;
     }
 
-    // --------------------------------------------------
-    // CATEGORY PAGES
-    // --------------------------------------------------
-
-    if (
-      pathname.startsWith("/category/")
-    ) {
-      return false;
-    }
-
-    // --------------------------------------------------
-    // OTHER NON-PRODUCT PAGES
-    // --------------------------------------------------
-
+    // Obvious non-product pages.
     const blockedPaths = [
       "/search",
       "/catalogsearch",
@@ -261,22 +464,25 @@ function isCandidateProductUrl(url) {
       "/track",
       "/seller",
       "/vendor",
-      "/brand"
+      "/brand",
+      "/brands"
     ];
 
-    for (const blocked of blockedPaths) {
+    for (
+      const blocked of blockedPaths
+    ) {
       if (
         pathname === blocked ||
         pathname.startsWith(
-          blocked + "/"
+          `${blocked}/`
         )
       ) {
         return false;
       }
     }
 
-    // Files are not products
-    const fileExtensions = [
+    // Common non-product file extensions.
+    const extensions = [
       ".xml",
       ".json",
       ".jpg",
@@ -284,16 +490,20 @@ function isCandidateProductUrl(url) {
       ".png",
       ".webp",
       ".gif",
+      ".svg",
       ".pdf",
       ".css",
-      ".js"
+      ".js",
+      ".txt"
     ];
 
     for (
-      const extension of fileExtensions
+      const extension of extensions
     ) {
       if (
-        pathname.endsWith(extension)
+        pathname.endsWith(
+          extension
+        )
       ) {
         return false;
       }
@@ -306,59 +516,374 @@ function isCandidateProductUrl(url) {
   }
 }
 
+// ============================================================
+// SITEMAP
+// ============================================================
 
-// ======================================================
-// BREADCRUMBS
-// ======================================================
-
-function extractBreadcrumbs($) {
-  const breadcrumbs = [];
-
-  $(
-    '[itemtype*="BreadcrumbList"] [itemprop="name"], ' +
-    ".breadcrumb li, " +
-    ".breadcrumbs li"
-  ).each((_, element) => {
-
-    const text = cleanText(
-      $(element).text()
+function extractSitemapUrls(xml) {
+  const $ =
+    cheerio.load(
+      xml,
+      {
+        xmlMode: true
+      }
     );
 
-    if (
-      text &&
-      !breadcrumbs.includes(text)
-    ) {
-      breadcrumbs.push(text);
-    }
-  });
+  const urls = [];
 
-  return breadcrumbs;
+  $("loc").each(
+    (_, element) => {
+      const url =
+        cleanText(
+          $(element).text()
+        );
+
+      if (url) {
+        urls.push(
+          normalizeUrl(url)
+        );
+      }
+    }
+  );
+
+  return uniqueArray(
+    urls
+  );
 }
 
+async function fetchText(
+  request,
+  url
+) {
+  for (
+    let attempt = 1;
+    attempt <= MAX_RETRIES;
+    attempt++
+  ) {
+    try {
+      const response =
+        await request.get(
+          url,
+          {
+            timeout:
+              PAGE_TIMEOUT
+          }
+        );
 
-// ======================================================
+      if (
+        response.ok()
+      ) {
+        return await response.text();
+      }
+
+      console.log(
+        `⚠️ Sitemap HTTP ${response.status()} - ${url}`
+      );
+
+    } catch (error) {
+
+      console.log(
+        `⚠️ Sitemap attempt ${attempt}/${MAX_RETRIES} failed: ${url}`
+      );
+
+      if (
+        attempt ===
+        MAX_RETRIES
+      ) {
+        throw error;
+      }
+    }
+
+    await sleep(
+      DELAY_MS *
+        attempt
+    );
+  }
+
+  return "";
+}
+
+async function discoverSitemaps(
+  request,
+  sitemapUrl,
+  visited = new Set()
+) {
+  sitemapUrl =
+    normalizeUrl(
+      sitemapUrl
+    );
+
+  if (
+    visited.has(
+      sitemapUrl
+    )
+  ) {
+    return [];
+  }
+
+  visited.add(
+    sitemapUrl
+  );
+
+  console.log(
+    `🗺️ Reading sitemap: ${sitemapUrl}`
+  );
+
+  const xml =
+    await fetchText(
+      request,
+      sitemapUrl
+    );
+
+  if (!xml) {
+    return [];
+  }
+
+  const $ =
+    cheerio.load(
+      xml,
+      {
+        xmlMode: true
+      }
+    );
+
+  const result = [];
+
+  // ----------------------------------------------------------
+  // Sitemap index
+  // ----------------------------------------------------------
+
+  const childSitemaps = [];
+
+  $("sitemap loc").each(
+    (_, element) => {
+      const child =
+        normalizeUrl(
+          $(element).text()
+        );
+
+      if (child) {
+        childSitemaps.push(
+          child
+        );
+      }
+    }
+  );
+
+  if (
+    childSitemaps.length
+  ) {
+    for (
+      const child of childSitemaps
+    ) {
+      const urls =
+        await discoverSitemaps(
+          request,
+          child,
+          visited
+        );
+
+      result.push(
+        ...urls
+      );
+    }
+
+    return uniqueArray(
+      result
+    );
+  }
+
+  // ----------------------------------------------------------
+  // Normal URL sitemap
+  // ----------------------------------------------------------
+
+  const urls =
+    extractSitemapUrls(
+      xml
+    );
+
+  result.push(
+    ...urls
+  );
+
+  return uniqueArray(
+    result
+  );
+}
+
+// ============================================================
+// JSON-LD
+// ============================================================
+
+function extractJsonLd($) {
+  const results = [];
+
+  $(
+    'script[type="application/ld+json"]'
+  ).each(
+    (_, element) => {
+
+      try {
+
+        const text =
+          $(element)
+            .text()
+            .trim();
+
+        if (!text) {
+          return;
+        }
+
+        const data =
+          JSON.parse(text);
+
+        if (
+          Array.isArray(
+            data
+          )
+        ) {
+          results.push(
+            ...data
+          );
+
+        } else if (
+          data &&
+          Array.isArray(
+            data["@graph"]
+          )
+        ) {
+          results.push(
+            ...data["@graph"]
+          );
+
+        } else {
+          results.push(
+            data
+          );
+        }
+
+      } catch {
+        // Ignore malformed JSON-LD.
+      }
+    }
+  );
+
+  return results;
+}
+
+function findProductJsonLd(
+  data
+) {
+  for (
+    const item of data
+  ) {
+
+    if (!item) {
+      continue;
+    }
+
+    const type =
+      item["@type"];
+
+    if (
+      type === "Product"
+    ) {
+      return item;
+    }
+
+    if (
+      Array.isArray(type) &&
+      type.includes("Product")
+    ) {
+      return item;
+    }
+  }
+
+  return null;
+}
+
+// ============================================================
+// BREADCRUMBS
+// ============================================================
+
+function extractBreadcrumbs($) {
+  const result = [];
+
+  // Schema breadcrumb.
+  $(
+    '[itemtype*="BreadcrumbList"] [itemprop="name"]'
+  ).each(
+    (_, element) => {
+
+      const value =
+        cleanText(
+          $(element).text()
+        );
+
+      if (value) {
+        result.push(
+          value
+        );
+      }
+    }
+  );
+
+  // Common breadcrumb selectors.
+  if (
+    result.length === 0
+  ) {
+
+    $(
+      ".breadcrumb li, " +
+      ".breadcrumbs li, " +
+      "nav.breadcrumb li"
+    ).each(
+      (_, element) => {
+
+        const value =
+          cleanText(
+            $(element).text()
+          );
+
+        if (value) {
+          result.push(
+            value
+          );
+        }
+      }
+    );
+  }
+
+  return uniqueArray(
+    result
+  );
+}
+
+// ============================================================
 // SPECIFICATIONS
-// ======================================================
+// ============================================================
 
 function extractSpecifications($) {
   const specifications = {};
 
-  // --------------------------------------------------
+  // ----------------------------------------------------------
   // Tables
-  // --------------------------------------------------
+  // ----------------------------------------------------------
 
   $("table tr").each(
     (_, row) => {
 
-      const cells = $(row)
-        .find("th, td")
-        .map((_, cell) =>
-          cleanText(
-            $(cell).text()
+      const cells =
+        $(row)
+          .find("th, td")
+          .map(
+            (_, cell) =>
+              cleanText(
+                $(cell).text()
+              )
           )
-        )
-        .get()
-        .filter(Boolean);
+          .get()
+          .filter(Boolean);
 
       if (
         cells.length >= 2
@@ -374,6 +899,54 @@ function extractSpecifications($) {
 
         if (
           key &&
+          value &&
+          key.length <= 150 &&
+          value.length <= 1000
+        ) {
+
+          if (
+            !specifications[key]
+          ) {
+            specifications[key] =
+              value;
+          }
+        }
+      }
+    }
+  );
+
+  // ----------------------------------------------------------
+  // Definition lists
+  // ----------------------------------------------------------
+
+  $("dl").each(
+    (_, dl) => {
+
+      const terms =
+        $(dl)
+          .find("dt")
+          .toArray();
+
+      for (
+        const dt of terms
+      ) {
+
+        const key =
+          cleanText(
+            $(dt).text()
+          );
+
+        const dd =
+          $(dt)
+            .next("dd");
+
+        const value =
+          cleanText(
+            dd.text()
+          );
+
+        if (
+          key &&
           value
         ) {
           specifications[key] =
@@ -383,9 +956,10 @@ function extractSpecifications($) {
     }
   );
 
-  // --------------------------------------------------
-  // List based specifications
-  // --------------------------------------------------
+  // ----------------------------------------------------------
+  // Only inspect list items that
+  // look like key/value pairs.
+  // ----------------------------------------------------------
 
   $("li").each(
     (_, element) => {
@@ -395,7 +969,10 @@ function extractSpecifications($) {
           $(element).text()
         );
 
-      if (!text) {
+      if (
+        !text ||
+        text.length > 600
+      ) {
         return;
       }
 
@@ -403,7 +980,8 @@ function extractSpecifications($) {
         text.indexOf(":");
 
       if (
-        colonIndex <= 0
+        colonIndex <= 0 ||
+        colonIndex > 120
       ) {
         return;
       }
@@ -423,18 +1001,11 @@ function extractSpecifications($) {
           )
         );
 
-      // Don't treat random page links
-      // as specifications.
-      if (
-        key.length > 100 ||
-        value.length > 500
-      ) {
-        return;
-      }
-
       if (
         key &&
         value &&
+        key.length <= 100 &&
+        value.length <= 500 &&
         !specifications[key]
       ) {
         specifications[key] =
@@ -446,15 +1017,20 @@ function extractSpecifications($) {
   return specifications;
 }
 
-
-// ======================================================
+// ============================================================
 // IMAGES
-// ======================================================
+// ============================================================
 
-function extractImages($, productJsonLd) {
+function extractImages(
+  $,
+  productJsonLd
+) {
   const images = [];
 
+  // ----------------------------------------------------------
   // JSON-LD
+  // ----------------------------------------------------------
+
   if (
     productJsonLd &&
     productJsonLd.image
@@ -475,7 +1051,10 @@ function extractImages($, productJsonLd) {
     }
   }
 
+  // ----------------------------------------------------------
   // OpenGraph
+  // ----------------------------------------------------------
+
   $('meta[property="og:image"]').each(
     (_, element) => {
 
@@ -485,101 +1064,122 @@ function extractImages($, productJsonLd) {
         );
 
       if (image) {
-        images.push(image);
+        images.push(
+          image
+        );
       }
     }
   );
 
-  // IMG tags
-  $("img").each(
-    (_, element) => {
+  // ----------------------------------------------------------
+  // Product gallery only
+  // ----------------------------------------------------------
 
-      const attributes = [
-        "src",
-        "data-src",
-        "data-original",
-        "data-lazy-src",
-        "data-image",
-        "data-zoom-image"
-      ];
+  const gallerySelectors = [
+    '[class*="product-gallery"] img',
+    '[class*="product-image"] img',
+    '[class*="product-images"] img',
+    '[class*="product_photo"] img',
+    '[class*="gallery"] img'
+  ];
 
-      for (
-        const attribute of attributes
-      ) {
+  for (
+    const selector of gallerySelectors
+  ) {
 
-        const value =
-          $(element).attr(
-            attribute
-          );
+    $(selector).each(
+      (_, element) => {
 
-        if (value) {
-          images.push(value);
+        const attributes = [
+          "src",
+          "data-src",
+          "data-original",
+          "data-lazy-src",
+          "data-image",
+          "data-zoom-image"
+        ];
+
+        for (
+          const attribute of attributes
+        ) {
+
+          const value =
+            $(element).attr(
+              attribute
+            );
+
+          if (value) {
+            images.push(
+              value
+            );
+          }
         }
       }
-    }
-  );
-
-  return [
-    ...new Set(
-      images
-        .filter(Boolean)
-        .map(absoluteUrl)
-        .filter(Boolean)
-    )
-  ];
-}
-
-
-// ======================================================
-// PRODUCT PAGE DETECTION
-// ======================================================
-
-function detectProductPage(
-  $,
-  productJsonLd,
-  url
-) {
-
-  // --------------------------------------------------
-  // IMPORTANT:
-  // Never accept category URLs.
-  // --------------------------------------------------
-
-  if (
-    !isCandidateProductUrl(url)
-  ) {
-    return false;
+    );
   }
 
-  // --------------------------------------------------
-  // Product JSON-LD
-  // --------------------------------------------------
+  return uniqueArray(
+    images
+      .map(
+        absoluteUrl
+      )
+      .filter(Boolean)
+  );
+}
 
-  if (productJsonLd) {
+// ============================================================
+// PRICE HELPERS
+// ============================================================
 
-    const type =
-      productJsonLd["@type"];
+function extractBodyPrice(
+  bodyText,
+  patterns
+) {
+  for (
+    const pattern of patterns
+  ) {
 
-    const isProduct =
-      type === "Product" ||
-      (
-        Array.isArray(type) &&
-        type.includes("Product")
+    const match =
+      bodyText.match(
+        pattern
       );
 
     if (
-      isProduct &&
-      cleanText(
-        productJsonLd.name
-      )
+      match &&
+      match[1]
     ) {
-      return true;
+      const value =
+        getNumber(
+          match[1]
+        );
+
+      if (
+        value !== null
+      ) {
+        return value;
+      }
     }
   }
 
-  // --------------------------------------------------
-  // Fallback detection
-  // --------------------------------------------------
+  return null;
+}
+
+// ============================================================
+// PRODUCT DETECTION
+// ============================================================
+
+function detectProductPage(
+  $,
+  productJsonLd
+) {
+  if (
+    productJsonLd &&
+    cleanText(
+      productJsonLd.name
+    )
+  ) {
+    return true;
+  }
 
   const bodyText =
     cleanText(
@@ -591,9 +1191,6 @@ function detectProductPage(
 
   let score = 0;
 
-  // Individual product pages usually have
-  // these elements.
-
   if (
     $("h1").length
   ) {
@@ -601,7 +1198,7 @@ function detectProductPage(
   }
 
   if (
-    /\bSKU\s*:/i.test(
+    /\bsku\s*:/i.test(
       bodyText
     )
   ) {
@@ -609,7 +1206,7 @@ function detectProductPage(
   }
 
   if (
-    /\bMRP\s*:/i.test(
+    /\bmrp\s*:/i.test(
       bodyText
     )
   ) {
@@ -640,48 +1237,36 @@ function detectProductPage(
     score += 2;
   }
 
-  if (
-    lower.includes(
-      "description"
-    )
-  ) {
-    score += 1;
-  }
-
-  // Need a strong combination.
-  return score >= 7;
+  return score >= 5;
 }
 
-
-// ======================================================
+// ============================================================
 // PRODUCT EXTRACTION
-// ======================================================
+// ============================================================
 
 function extractProduct(
   url,
   html
 ) {
-
   const $ =
-    cheerio.load(html);
+    cheerio.load(
+      html
+    );
 
   const jsonLd =
-    extractJsonLd($);
+    extractJsonLd(
+      $
+    );
 
   const productJsonLd =
     findProductJsonLd(
       jsonLd
     );
 
-  // --------------------------------------------------
-  // Is this really a product?
-  // --------------------------------------------------
-
   if (
     !detectProductPage(
       $,
-      productJsonLd,
-      url
+      productJsonLd
     )
   ) {
     return null;
@@ -690,9 +1275,14 @@ function extractProduct(
   const product =
     productJsonLd || {};
 
-  // --------------------------------------------------
+  const bodyText =
+    cleanText(
+      $("body").text()
+    );
+
+  // ----------------------------------------------------------
   // NAME
-  // --------------------------------------------------
+  // ----------------------------------------------------------
 
   const name =
     cleanText(
@@ -715,9 +1305,9 @@ function extractProduct(
     return null;
   }
 
-  // --------------------------------------------------
+  // ----------------------------------------------------------
   // SKU
-  // --------------------------------------------------
+  // ----------------------------------------------------------
 
   let sku =
     cleanText(
@@ -733,14 +1323,9 @@ function extractProduct(
 
   if (!sku) {
 
-    const bodyText =
-      cleanText(
-        $("body").text()
-      );
-
     const match =
       bodyText.match(
-        /\bSKU\s*:\s*([A-Za-z0-9._-]+)/i
+        /\bSKU\s*[:#-]?\s*([A-Za-z0-9._/-]+)/i
       );
 
     if (match) {
@@ -751,9 +1336,9 @@ function extractProduct(
     }
   }
 
-  // --------------------------------------------------
+  // ----------------------------------------------------------
   // BRAND
-  // --------------------------------------------------
+  // ----------------------------------------------------------
 
   let brand = "";
 
@@ -779,27 +1364,24 @@ function extractProduct(
 
   if (!brand) {
 
-    const bodyText =
-      cleanText(
-        $("body").text()
-      );
-
-    const match =
+    const brandMatch =
       bodyText.match(
-        /\bBrand\s*:\s*(.+?)(?=\s+SKU\s*:|\s+MRP\s*:|$)/i
+        /\bBrand\s*:\s*(.+?)(?=\s+(?:SKU|MRP|Price)\s*:|$)/i
       );
 
-    if (match) {
+    if (
+      brandMatch
+    ) {
       brand =
         cleanText(
-          match[1]
+          brandMatch[1]
         );
     }
   }
 
-  // --------------------------------------------------
-  // OFFER
-  // --------------------------------------------------
+  // ----------------------------------------------------------
+  // OFFERS
+  // ----------------------------------------------------------
 
   let offer = null;
 
@@ -817,118 +1399,140 @@ function extractProduct(
       null;
   }
 
-  // --------------------------------------------------
+  // ----------------------------------------------------------
   // SELLING PRICE
-  // --------------------------------------------------
+  // ----------------------------------------------------------
 
-  let sellingPrice = null;
+  let sellingPrice =
+    getNumber(
+      offer?.price
+    );
 
-  if (offer) {
+  if (
+    sellingPrice === null
+  ) {
 
     sellingPrice =
       getNumber(
-        offer.price ||
-        offer.lowPrice
+        $('meta[itemprop="price"]')
+          .attr("content")
       );
   }
 
-  if (!sellingPrice) {
+  if (
+    sellingPrice === null
+  ) {
 
-    const priceMeta =
-      $('meta[itemprop="price"]')
-        .attr("content");
-
-    if (priceMeta) {
-      sellingPrice =
-        getNumber(
-          priceMeta
-        );
-    }
+    sellingPrice =
+      extractBodyPrice(
+        bodyText,
+        [
+          /(?:Selling\s*Price|Sale\s*Price|Offer\s*Price)\s*[:\-]?\s*₹?\s*([\d,]+(?:\.\d+)?)/i,
+          /(?:Price)\s*[:\-]?\s*₹?\s*([\d,]+(?:\.\d+)?)/i
+        ]
+      );
   }
 
-  // --------------------------------------------------
+  // ----------------------------------------------------------
   // MRP
-  // --------------------------------------------------
+  // ----------------------------------------------------------
 
   let mrp = null;
 
-  if (offer) {
+  const mrpSelectors = [
+    '[class*="mrp"]',
+    '[class*="MRP"]',
+    '[class*="old-price"]',
+    '[class*="old_price"]',
+    '[class*="regular-price"]',
+    '[class*="regular_price"]'
+  ];
 
-    mrp =
-      getNumber(
-        offer.highPrice
-      );
-  }
-
-  // Try common MRP elements
-  if (!mrp) {
-
-    const selectors = [
-      '[class*="mrp"]',
-      '[class*="MRP"]',
-      '[class*="old-price"]',
-      '[class*="regular-price"]'
-    ];
-
-    for (
-      const selector of selectors
-    ) {
-
-      const value =
-        $(selector)
-          .first()
-          .text();
-
-      const number =
-        getNumber(value);
-
-      if (number) {
-        mrp =
-          number;
-        break;
-      }
-    }
-  }
-
-  // --------------------------------------------------
-  // FALLBACK PRICE FROM BODY
-  // --------------------------------------------------
-
-  if (
-    !sellingPrice ||
-    !mrp
+  for (
+    const selector of mrpSelectors
   ) {
 
-    const bodyText =
-      cleanText(
-        $("body").text()
-      );
+    const value =
+      $(selector)
+        .first()
+        .text();
 
-    const mrpMatch =
-      bodyText.match(
-        /MRP\s*:\s*₹?\s*([\d,]+(?:\.\d+)?)/i
+    const number =
+      getNumber(
+        value
       );
 
     if (
-      mrpMatch &&
-      !mrp
+      number !== null
     ) {
       mrp =
-        getNumber(
-          mrpMatch[1]
-        );
+        number;
+      break;
     }
   }
 
-  // --------------------------------------------------
+  if (
+    mrp === null
+  ) {
+
+    mrp =
+      extractBodyPrice(
+        bodyText,
+        [
+          /MRP\s*[:\-]?\s*₹?\s*([\d,]+(?:\.\d+)?)/i,
+          /Maximum\s*Retail\s*Price\s*[:\-]?\s*₹?\s*([\d,]+(?:\.\d+)?)/i
+        ]
+      );
+  }
+
+  // ----------------------------------------------------------
+  // JSON-LD price range fallback
+  // ----------------------------------------------------------
+
+  if (
+    mrp === null &&
+    offer
+  ) {
+
+    const high =
+      getNumber(
+        offer.highPrice
+      );
+
+    const low =
+      getNumber(
+        offer.lowPrice
+      );
+
+    // Only use highPrice as MRP when it
+    // represents a range and differs from
+    // the actual selling price.
+    if (
+      high !== null &&
+      sellingPrice !== null &&
+      high > sellingPrice
+    ) {
+      mrp =
+        high;
+    } else if (
+      low !== null &&
+      sellingPrice !== null &&
+      low > sellingPrice
+    ) {
+      mrp =
+        low;
+    }
+  }
+
+  // ----------------------------------------------------------
   // DISCOUNT
-  // --------------------------------------------------
+  // ----------------------------------------------------------
 
   let discount = null;
 
   if (
-    mrp &&
-    sellingPrice &&
+    mrp !== null &&
+    sellingPrice !== null &&
     mrp > sellingPrice
   ) {
 
@@ -944,44 +1548,43 @@ function extractProduct(
       );
   }
 
-  // --------------------------------------------------
+  // ----------------------------------------------------------
   // DESCRIPTION
-  // --------------------------------------------------
+  // ----------------------------------------------------------
 
   const description =
     cleanText(
       product.description
     ) ||
     cleanText(
+      $(
+        '[class*="description"]'
+      )
+        .first()
+        .text()
+    ) ||
+    cleanText(
       $('meta[name="description"]')
         .attr("content")
     );
 
-  // --------------------------------------------------
+  // ----------------------------------------------------------
   // SHORT DESCRIPTION
-  // --------------------------------------------------
+  // ----------------------------------------------------------
 
-  let shortDescription = "";
+  const shortDescription =
+    cleanText(
+      $(
+        '[class*="short-description"], ' +
+        '[class*="short_description"]'
+      )
+        .first()
+        .text()
+    );
 
-  const shortDescriptionElement =
-    $(
-      '[class*="short-description"], ' +
-      '[class*="short_description"]'
-    ).first();
-
-  if (
-    shortDescriptionElement.length
-  ) {
-
-    shortDescription =
-      cleanText(
-        shortDescriptionElement.text()
-      );
-  }
-
-  // --------------------------------------------------
+  // ----------------------------------------------------------
   // RATING
-  // --------------------------------------------------
+  // ----------------------------------------------------------
 
   let rating = null;
   let reviewCount = null;
@@ -1008,15 +1611,14 @@ function extractProduct(
       );
   }
 
-  // --------------------------------------------------
+  // ----------------------------------------------------------
   // AVAILABILITY
-  // --------------------------------------------------
+  // ----------------------------------------------------------
 
   let availability = "";
 
   if (
-    offer &&
-    offer.availability
+    offer?.availability
   ) {
 
     availability =
@@ -1028,12 +1630,36 @@ function extractProduct(
       );
   }
 
-  // --------------------------------------------------
+  if (!availability) {
+
+    const lower =
+      bodyText.toLowerCase();
+
+    if (
+      lower.includes(
+        "out of stock"
+      )
+    ) {
+      availability =
+        "OutOfStock";
+    } else if (
+      lower.includes(
+        "in stock"
+      )
+    ) {
+      availability =
+        "InStock";
+    }
+  }
+
+  // ----------------------------------------------------------
   // BREADCRUMBS
-  // --------------------------------------------------
+  // ----------------------------------------------------------
 
   const breadcrumbs =
-    extractBreadcrumbs($);
+    extractBreadcrumbs(
+      $
+    );
 
   let category = "";
   let subcategory = "";
@@ -1058,16 +1684,18 @@ function extractProduct(
       ];
   }
 
-  // --------------------------------------------------
+  // ----------------------------------------------------------
   // SPECIFICATIONS
-  // --------------------------------------------------
+  // ----------------------------------------------------------
 
   const specifications =
-    extractSpecifications($);
+    extractSpecifications(
+      $
+    );
 
-  // --------------------------------------------------
+  // ----------------------------------------------------------
   // IMAGES
-  // --------------------------------------------------
+  // ----------------------------------------------------------
 
   const images =
     extractImages(
@@ -1075,26 +1703,29 @@ function extractProduct(
       product
     );
 
-  // --------------------------------------------------
+  // ----------------------------------------------------------
   // PRODUCT ID
-  // --------------------------------------------------
+  // ----------------------------------------------------------
 
   const productId =
     cleanText(
       product.productID
     ) ||
     cleanText(
+      product.productId
+    ) ||
+    cleanText(
       $(
         '[itemprop="productID"]'
-      ).attr("content")
+      )
+        .attr("content")
     );
 
-  // --------------------------------------------------
-  // FINAL PRODUCT
-  // --------------------------------------------------
+  // ----------------------------------------------------------
+  // FINAL
+  // ----------------------------------------------------------
 
   return {
-
     url,
 
     product_id:
@@ -1145,27 +1776,366 @@ function extractProduct(
   };
 }
 
+// ============================================================
+// REQUEST RETRY
+// ============================================================
 
-// ======================================================
+async function fetchPage(
+  page,
+  url
+) {
+  for (
+    let attempt = 1;
+    attempt <= MAX_RETRIES;
+    attempt++
+  ) {
+
+    try {
+
+      const response =
+        await page.goto(
+          url,
+          {
+            waitUntil:
+              "domcontentloaded",
+            timeout:
+              PAGE_TIMEOUT
+          }
+        );
+
+      if (!response) {
+        throw new Error(
+          "No response"
+        );
+      }
+
+      const status =
+        response.status();
+
+      if (
+        status >= 400
+      ) {
+
+        throw new Error(
+          `HTTP ${status}`
+        );
+      }
+
+      // Give client-side rendering
+      // a short opportunity to finish.
+      await page.waitForTimeout(
+        500
+      );
+
+      return await page.content();
+
+    } catch (error) {
+
+      console.log(
+        `   ⚠️ Attempt ${attempt}/${MAX_RETRIES}: ${error.message}`
+      );
+
+      if (
+        attempt ===
+        MAX_RETRIES
+      ) {
+        throw error;
+      }
+
+      await sleep(
+        DELAY_MS *
+          Math.pow(
+            2,
+            attempt - 1
+          )
+      );
+    }
+  }
+
+  throw new Error(
+    "Failed to fetch page"
+  );
+}
+
+// ============================================================
+// WORKER
+// ============================================================
+
+async function scrapeUrl(
+  context,
+  url,
+  workerId
+) {
+  if (
+    processedUrls.has(
+      url
+    )
+  ) {
+    return null;
+  }
+
+  const page =
+    await context.newPage();
+
+  try {
+
+    console.log(
+      `[Worker ${workerId}] ${url}`
+    );
+
+    const html =
+      await fetchPage(
+        page,
+        url
+      );
+
+    const product =
+      extractProduct(
+        url,
+        html
+      );
+
+    processedUrls.add(
+      url
+    );
+
+    if (!product) {
+
+      console.log(
+        `[Worker ${workerId}] ❌ Not product`
+      );
+
+      return null;
+    }
+
+    console.log(
+      `[Worker ${workerId}] ✅ ${product.name}`
+    );
+
+    return product;
+
+  } finally {
+
+    await page.close();
+  }
+}
+
+// ============================================================
+// CONCURRENT CRAWLER
+// ============================================================
+
+async function crawlProducts(
+  context
+) {
+  let cursor = 0;
+
+  let lastSaveCount =
+    products.length;
+
+  async function worker(
+    workerId
+  ) {
+
+    while (
+      !shuttingDown
+    ) {
+
+      if (
+        products.length >=
+        TARGET_PRODUCTS
+      ) {
+        return;
+      }
+
+      const index =
+        cursor++;
+
+      if (
+        index >=
+        productUrls.length
+      ) {
+        return;
+      }
+
+      const url =
+        productUrls[index];
+
+      if (
+        processedUrls.has(
+          url
+        )
+      ) {
+        continue;
+      }
+
+      try {
+
+        const product =
+          await scrapeUrl(
+            context,
+            url,
+            workerId
+          );
+
+        if (
+          product
+        ) {
+
+          // Deduplicate using URL.
+          const exists =
+            products.some(
+              item =>
+                item.url ===
+                product.url
+            );
+
+          if (!exists) {
+            products.push(
+              product
+            );
+          }
+
+          if (
+            products.length -
+              lastSaveCount >=
+            SAVE_EVERY
+          ) {
+
+            lastSaveCount =
+              products.length;
+
+            saveAll();
+          }
+        }
+
+      } catch (error) {
+
+        console.log(
+          `[Worker ${workerId}] ❌ FAILED: ${url}`
+        );
+
+        failedUrls.push({
+          url,
+          error:
+            error.message,
+          failed_at:
+            new Date().toISOString()
+        });
+      }
+
+      await sleep(
+        DELAY_MS
+      );
+    }
+  }
+
+  const workers = [];
+
+  const workerCount =
+    Math.min(
+      CONCURRENCY,
+      productUrls.length
+    );
+
+  for (
+    let i = 1;
+    i <= workerCount;
+    i++
+  ) {
+    workers.push(
+      worker(i)
+    );
+  }
+
+  await Promise.all(
+    workers
+  );
+}
+
+// ============================================================
+// GRACEFUL SHUTDOWN
+// ============================================================
+
+function setupShutdown() {
+  const shutdown =
+    signal => {
+
+      if (
+        shuttingDown
+      ) {
+        return;
+      }
+
+      shuttingDown = true;
+
+      console.log(
+        `\n\n🛑 Received ${signal}.`
+      );
+
+      console.log(
+        "Saving current progress..."
+      );
+
+      saveAll();
+
+      console.log(
+        "Progress saved safely."
+      );
+    };
+
+  process.on(
+    "SIGINT",
+    shutdown
+  );
+
+  process.on(
+    "SIGTERM",
+    shutdown
+  );
+}
+
+// ============================================================
 // MAIN
-// ======================================================
+// ============================================================
 
 async function main() {
 
+  ensureOutputDirectory();
+
+  setupShutdown();
+
+  loadPreviousProgress();
+
   console.log("");
   console.log(
-    "======================================"
+    "=================================================="
   );
   console.log(
-    " TOOLSVILLA - PRODUCT TEST"
+    " TOOLSVILLA FULL PRODUCT CRAWLER"
   );
   console.log(
-    "======================================"
+    "=================================================="
   );
   console.log("");
 
   console.log(
-    `Target products: ${TARGET_PRODUCTS}`
+    `Target products : ${
+      TARGET_PRODUCTS === Infinity
+        ? "ALL"
+        : TARGET_PRODUCTS
+    }`
+  );
+
+  console.log(
+    `Concurrency     : ${CONCURRENCY}`
+  );
+
+  console.log(
+    `Delay           : ${DELAY_MS}ms`
+  );
+
+  console.log(
+    `Output          : ${OUTPUT_DIR}`
   );
 
   console.log("");
@@ -1175,8 +2145,8 @@ async function main() {
       headless: true
     });
 
-  const page =
-    await browser.newPage({
+  const context =
+    await browser.newContext({
 
       viewport: {
         width: 1440,
@@ -1184,352 +2154,162 @@ async function main() {
       },
 
       userAgent:
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/151 Safari/537.36"
+        USER_AGENT,
+
+      locale:
+        "en-IN",
+
+      timezoneId:
+        "Asia/Kolkata"
     });
 
   try {
 
-    // ==================================================
-    // DOWNLOAD SITEMAP
-    // ==================================================
+    // ========================================================
+    // SITEMAP
+    // ========================================================
 
     console.log(
-      "Reading sitemap..."
+      "🔎 Discovering sitemap URLs..."
     );
 
-    const sitemapResponse =
-      await page.request.get(
+    const request =
+      await context.request;
+
+    const allSitemapUrls =
+      await discoverSitemaps(
+        request,
         SITEMAP_URL
       );
 
-    if (
-      !sitemapResponse.ok()
-    ) {
-
-      throw new Error(
-        `Sitemap returned HTTP ${sitemapResponse.status()}`
-      );
-    }
-
-    const xml =
-      await sitemapResponse.text();
-
-    const $xml =
-      cheerio.load(
-        xml,
-        {
-          xmlMode: true
-        }
-      );
-
-    let urls = [];
-
-    $xml("url loc").each(
-      (_, element) => {
-
-        const url =
-          cleanText(
-            $xml(element).text()
-          );
-
-        if (url) {
-          urls.push(url);
-        }
-      }
-    );
-
-    urls = [
-      ...new Set(urls)
-    ];
-
+    console.log("");
     console.log(
-      `Found ${urls.length} URLs in sitemap.`
-    );
-
-    // ==================================================
-    // FILTER URLs
-    // ==================================================
-
-    const originalCount =
-      urls.length;
-
-    urls =
-      urls.filter(
-        isCandidateProductUrl
-      );
-
-    console.log(
-      `URLs after filtering: ${urls.length}`
-    );
-
-    console.log(
-      `Filtered out: ${
-        originalCount -
-        urls.length
+      `🗺️ URLs discovered from sitemap(s): ${
+        allSitemapUrls.length
       }`
     );
 
-    console.log("");
+    // ========================================================
+    // PRODUCT URL FILTER
+    // ========================================================
 
-    console.log(
-      "Searching for genuine product pages..."
-    );
-
-    console.log("");
-
-    // ==================================================
-    // SCRAPE
-    // ==================================================
-
-    const products = [];
-
-    let checked = 0;
-
-    for (
-      let i = 0;
-      i < urls.length &&
-      products.length < TARGET_PRODUCTS;
-      i++
-    ) {
-
-      const url =
-        urls[i];
-
-      checked++;
-
-      console.log(
-        `[Checked ${checked}] Products found: ${products.length}/${TARGET_PRODUCTS}`
+    productUrls =
+      uniqueArray(
+        allSitemapUrls
+          .filter(
+            isCandidateProductUrl
+          )
+          .map(
+            normalizeUrl
+          )
       );
 
-      console.log(
-        `  ${url}`
-      );
-
-      try {
-
-        const response =
-          await page.goto(
-            url,
-            {
-              waitUntil:
-                "domcontentloaded",
-
-              timeout: 30000
-            }
-          );
-
-        if (!response) {
-
-          console.log(
-            "  -> No response"
-          );
-
-          continue;
-        }
-
-        if (
-          !response.ok()
-        ) {
-
-          console.log(
-            `  -> HTTP ${response.status()}`
-          );
-
-          continue;
-        }
-
-        // Allow JavaScript to finish
-        await page.waitForTimeout(
-          1000
-        );
-
-        const html =
-          await page.content();
-
-        const product =
-          extractProduct(
-            url,
-            html
-          );
-
-        // ----------------------------------------------
-        // NOT PRODUCT
-        // ----------------------------------------------
-
-        if (!product) {
-
-          console.log(
-            "  -> Not a product page"
-          );
-
-          await sleep(
-            DELAY_MS
-          );
-
-          continue;
-        }
-
-        // ----------------------------------------------
-        // PRODUCT FOUND
-        // ----------------------------------------------
-
-        products.push(
-          product
-        );
-
-        console.log(
-          "  -> ✅ PRODUCT FOUND"
-        );
-
-        console.log(
-          `     Name: ${
-            product.name
-          }`
-        );
-
-        console.log(
-          `     SKU: ${
-            product.sku ||
-            "N/A"
-          }`
-        );
-
-        console.log(
-          `     Brand: ${
-            product.brand ||
-            "N/A"
-          }`
-        );
-
-        console.log(
-          `     MRP: ${
-            product.mrp ??
-            "N/A"
-          }`
-        );
-
-        console.log(
-          `     Selling Price: ${
-            product.selling_price ??
-            "N/A"
-          }`
-        );
-
-        console.log(
-          `     Images: ${
-            product.images.length
-          }`
-        );
-
-        console.log("");
-
-        // ----------------------------------------------
-        // SAVE PROGRESS
-        // ----------------------------------------------
-
-        fs.writeFileSync(
-          JSON_FILE,
-          JSON.stringify(
-            products,
-            null,
-            2
-          ),
-          "utf8"
-        );
-
-        saveCSV(
-          products
-        );
-
-        await sleep(
-          DELAY_MS
-        );
-
-      } catch (error) {
-
-        console.log(
-          `  -> ERROR: ${error.message}`
-        );
-
-        await sleep(
-          DELAY_MS
-        );
-      }
-    }
-
-    // ==================================================
-    // FINAL SAVE
-    // ==================================================
-
-    fs.writeFileSync(
-      JSON_FILE,
-      JSON.stringify(
-        products,
-        null,
-        2
-      ),
-      "utf8"
-    );
-
-    saveCSV(
-      products
-    );
-
-    // ==================================================
-    // SUMMARY
-    // ==================================================
-
-    console.log("");
-
     console.log(
-      "======================================"
+      `🛒 Candidate URLs: ${
+        productUrls.length
+      }`
     );
 
-    console.log(
-      " TEST FINISHED"
-    );
-
-    console.log(
-      "======================================"
-    );
-
-    console.log(
-      `URLs checked: ${checked}`
-    );
-
-    console.log(
-      `Products found: ${products.length}`
-    );
-
-    console.log(
-      `JSON file: ${JSON_FILE}`
-    );
-
-    console.log(
-      `CSV file: ${CSV_FILE}`
-    );
-
-    console.log("");
+    // ========================================================
+    // LIMIT
+    // ========================================================
 
     if (
-      products.length ===
-      TARGET_PRODUCTS
+      TARGET_PRODUCTS !== Infinity
     ) {
 
-      console.log(
-        `✅ Successfully found ${products.length} products.`
-      );
-
-    } else {
-
-      console.log(
-        `⚠️ Only found ${products.length} products out of ${TARGET_PRODUCTS}.`
-      );
-
-      console.log(
-        "We should inspect the results before increasing the limit."
-      );
+      productUrls =
+        productUrls.slice(
+          0,
+          TARGET_PRODUCTS
+        );
     }
+
+    console.log(
+      `🚀 URLs queued: ${
+        productUrls.length
+      }`
+    );
+
+    // ========================================================
+    // REMOVE ALREADY PROCESSED
+    // ========================================================
+
+    const remaining =
+      productUrls.filter(
+        url =>
+          !processedUrls.has(
+            url
+          )
+      );
+
+    console.log(
+      `♻️ Already processed: ${
+        productUrls.length -
+        remaining.length
+      }`
+    );
+
+    console.log(
+      `📋 Remaining: ${
+        remaining.length
+      }`
+    );
+
+    productUrls =
+      remaining;
+
+    console.log("");
+
+    // ========================================================
+    // CRAWL
+    // ========================================================
+
+    await crawlProducts(
+      context
+    );
+
+    // ========================================================
+    // FINAL SAVE
+    // ========================================================
+
+    saveAll();
+
+    console.log("");
+    console.log(
+      "=================================================="
+    );
+    console.log(
+      " CRAWL FINISHED"
+    );
+    console.log(
+      "=================================================="
+    );
+
+    console.log(
+      `Products found : ${products.length}`
+    );
+
+    console.log(
+      `URLs processed  : ${processedUrls.size}`
+    );
+
+    console.log(
+      `Failed URLs     : ${failedUrls.length}`
+    );
+
+    console.log("");
+    console.log(
+      `JSON: ${JSON_FILE}`
+    );
+
+    console.log(
+      `CSV : ${CSV_FILE}`
+    );
+
+    console.log(
+      `Failed: ${FAILED_FILE}`
+    );
 
     console.log("");
 
@@ -1539,24 +2319,36 @@ async function main() {
   }
 }
 
-
-// ======================================================
+// ============================================================
 // START
-// ======================================================
+// ============================================================
 
-main().catch(
-  (error) => {
+main()
+  .catch(error => {
 
     console.error("");
-
     console.error(
-      "SCRAPER FAILED"
+      "=================================================="
+    );
+    console.error(
+      " SCRAPER FAILED"
+    );
+    console.error(
+      "=================================================="
     );
 
     console.error(
       error
     );
 
+    // Always attempt to preserve
+    // whatever has already been collected.
+    try {
+      ensureOutputDirectory();
+      saveAll();
+    } catch {
+      // Ignore save failure.
+    }
+
     process.exit(1);
-  }
-);
+  });
